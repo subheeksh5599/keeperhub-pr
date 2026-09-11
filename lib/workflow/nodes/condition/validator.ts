@@ -94,6 +94,41 @@ const BRACKET_EXPRESSION_PATTERN = /(\w+)\s*\[([^\]]+)\]/g;
 const VALID_BRACKET_ACCESS_PATTERN = /^__v\d+$/;
 const VALID_BRACKET_CONTENT_PATTERN = /^(\d+|'[^']*'|"[^"]*")$/;
 
+// A string literal whose contents contain a bracket character. Such a literal
+// cannot be a bracket index key (those are digits or plain quoted names), but it
+// can be a regex pattern, and the scans below cannot tell the two apart from the
+// raw text: `"^0x[0-9a-fA-F]{40}$"` reads as `f[0-9a-fA-F]` indexing and fails
+// with "Cannot index". Blank the interior before scanning, keeping the quotes
+// and the length so offsets in the error messages stay accurate.
+const BRACKET_BEARING_LITERAL_PATTERN =
+  /"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'/g;
+
+const BRACKET_CHAR_PATTERN = /[[\]]/;
+
+function maskBracketBearingStrings(expression: string): string {
+  return expression.replace(BRACKET_BEARING_LITERAL_PATTERN, (literal) =>
+    BRACKET_CHAR_PATTERN.test(literal)
+      ? `"${" ".repeat(Math.max(literal.length - 2, 0))}"`
+      : literal
+  );
+}
+
+// Unanchored string-literal matcher (the module's STRING_LITERAL_PATTERN is
+// anchored with ^, so it only ever matches at an offset).
+const ANY_STRING_LITERAL_PATTERN = /(['"])(?:\\.|(?!\1).)*\1/g;
+
+/** Half-open [start, end) ranges covered by a string literal. */
+function stringLiteralSpans(expression: string): [number, number][] {
+  const spans: [number, number][] = [];
+  const pattern = new RegExp(ANY_STRING_LITERAL_PATTERN.source, "g");
+  let match: RegExpExecArray | null = null;
+  // biome-ignore lint/suspicious/noAssignInExpressions: Standard pattern for regex.exec in loop
+  while ((match = pattern.exec(expression)) !== null) {
+    spans.push([match.index, match.index + match[0].length]);
+  }
+  return spans;
+}
+
 // Top-level regex patterns for token validation
 const WHITESPACE_SPLIT_PATTERN = /\s+/;
 const VARIABLE_TOKEN_PATTERN = /^__v\d+/;
@@ -148,12 +183,15 @@ function checkDangerousPatterns(expression: string): ValidationResult {
  * - Blocked: Array literals like [1,2,3], or dangerous expressions like __v0[eval('x')]
  */
 function checkBracketExpressions(expression: string): ValidationResult {
+  // Scan the masked copy: brackets inside a string literal are pattern text, not
+  // indexing (see maskBracketBearingStrings).
+  const scanned = maskBracketBearingStrings(expression);
   BRACKET_EXPRESSION_PATTERN.lastIndex = 0;
 
   // Use exec loop for compatibility
   let match: RegExpExecArray | null = null;
   while (true) {
-    match = BRACKET_EXPRESSION_PATTERN.exec(expression);
+    match = BRACKET_EXPRESSION_PATTERN.exec(scanned);
     if (match === null) {
       break;
     }
@@ -184,7 +222,7 @@ function checkBracketExpressions(expression: string): ValidationResult {
   // This catches cases like "[1, 2, 3]" at the start of expression or after operators
   const standaloneArrayPattern = /(?:^|[=!<>&|(\s])\s*\[/g;
   standaloneArrayPattern.lastIndex = 0;
-  if (standaloneArrayPattern.test(expression)) {
+  if (standaloneArrayPattern.test(scanned)) {
     return {
       valid: false,
       error:
@@ -505,6 +543,19 @@ function tokenizeExpression(
       continue;
     }
 
+    // Argument separator. Typed as a separator rather than an operator so the
+    // operator rules below do not read it as one: `matchesRegex(a, b)` is a call,
+    // not a comma-expression.
+    if (expression[i] === ",") {
+      tokens.push({
+        type: "separator",
+        value: ",",
+        start: i,
+      });
+      i++;
+      continue;
+    }
+
     // Single character operators
     if (
       ["!", ">", "<", "(", ")", "+", "-", "*", "/", "%", "."].includes(
@@ -608,11 +659,26 @@ function validateOperatorSpacing(
     }
   }
 
+  // Skip operators that sit inside a string literal. The scan above runs on the
+  // raw text, so the `-` in a regex pattern such as `"^0x[0-9a-fA-F]{40}$"` is
+  // read as subtraction and fails the spacing rule, which is how a valid
+  // matchesRegex condition was rejected in the editor.
+  const literalSpans = stringLiteralSpans(expression);
+
   // Validate spacing for each operator
   for (const opMatch of operatorMatches) {
     const operatorValue = opMatch.value;
     const operatorStart = opMatch.index;
     const operatorEnd = operatorStart + operatorValue.length;
+
+    // Inside a quoted pattern, not an operator.
+    if (
+      literalSpans.some(
+        ([start, end]) => operatorStart >= start && operatorEnd <= end
+      )
+    ) {
+      continue;
+    }
 
     // Skip unary operators at start or after certain operators
     if (operatorValue === "-" || operatorValue === "!") {

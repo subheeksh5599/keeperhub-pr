@@ -35,6 +35,11 @@ import {
 const HEX_RE = /^[0-9a-fA-F]+$/;
 const WHITESPACE_RE = /\s/;
 
+// Refuse a pattern long enough to be a ReDoS rather than a match. Not a
+// correctness bound: it only stops an author (or a template that resolves into
+// the operand) from handing the executor a pattern nobody would type by hand.
+const MAX_REGEX_PATTERN_LENGTH = 512;
+
 const ALLOWED_METHODS = new Set([
   "includes",
   "startsWith",
@@ -51,6 +56,19 @@ const BLOCKED_PROPS = new Set(["constructor", "__proto__", "prototype"]);
 
 const ALLOWED_GLOBALS: Record<string, (...args: unknown[]) => unknown> = {
   String: (...args) => String(args[0]),
+  // Constructs the RegExp here, in trusted code rather than in the interpreted
+  // expression: the grammar stays closed (no `new`, no `test`) and the pattern
+  // is still a config value the author typed. Bounded because a pathological
+  // pattern is a ReDoS, and this runs inside the executor.
+  matchesRegex: (value, pattern) => {
+    const source = String(pattern);
+    if (source.length > MAX_REGEX_PATTERN_LENGTH) {
+      throw new Error(
+        `Regex pattern is longer than ${MAX_REGEX_PATTERN_LENGTH} characters`
+      );
+    }
+    return new RegExp(source).test(String(value));
+  },
 };
 
 const ALLOWED_STATIC: Record<string, (...args: unknown[]) => unknown> = {
