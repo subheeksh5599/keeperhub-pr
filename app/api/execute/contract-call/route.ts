@@ -4,7 +4,11 @@ import "server-only";
 
 import { NextResponse } from "next/server";
 import { resolveAbi } from "@/lib/abi/cache";
-import { type AbiItem, findAbiFunction } from "@/lib/abi/utils";
+import {
+  type AbiItem,
+  describeAmbiguousKey,
+  resolveAbiFunction,
+} from "@/lib/abi/utils";
 import { enforceExecutionLimit } from "@/lib/billing/execution-guard";
 import { enterApiExecuteErrorContext } from "@/lib/db/org-helpers";
 import { simulateContractCall } from "@/lib/execute/simulate";
@@ -32,7 +36,7 @@ import {
   withRejectedSignerOverride,
 } from "../_lib/execution-service";
 import { checkRateLimit } from "../_lib/rate-limit";
-import { parseNativeValueWei } from "../_lib/reserved-value";
+import { parseNativeValueEther } from "../_lib/reserved-value";
 import { parseSimulateFlag } from "../_lib/simulate-flag";
 import { checkAndReserveExecution } from "../_lib/spending-cap";
 import type { ExecuteResponse } from "../_lib/types";
@@ -54,13 +58,17 @@ function findFunctionInAbi(
     return { error: "ABI must be a JSON array" };
   }
 
-  const entry = findAbiFunction(parsed, functionName);
+  const resolution = resolveAbiFunction(parsed, functionName);
 
-  if (!entry) {
+  if (resolution.status === "ambiguous") {
+    return { error: describeAmbiguousKey(functionName, resolution.candidates) };
+  }
+
+  if (resolution.status !== "found") {
     return { error: `Function '${functionName}' not found in ABI` };
   }
 
-  return { entry };
+  return { entry: resolution.entry };
 }
 
 async function resolveAbiForRequest(
@@ -151,7 +159,7 @@ async function handleWriteCall(
 
   const redactedInput = redactInput(withRejectedSignerOverride(body, body));
   // Charge any native ETH value sent with the call against the daily value cap.
-  const parsedValue = parseNativeValueWei(body.value as string | undefined);
+  const parsedValue = parseNativeValueEther(body.value as string | undefined);
   if (!parsedValue.ok) {
     return recordIdempotentResponse(
       idem,
@@ -238,15 +246,15 @@ async function handleWriteCall(
   // against the execution, so withholding it from the response leaves the
   // caller with less than the row it just wrote.
   //
-  // transactionLink stays on the success arm because the failure return does
-  // not set one.
+  // transactionLink is returned whenever core set one, including a
+  // sponsored-relay failure that still produced an explorer URL.
   const responseBody: ExecuteResponse = {
     executionId,
     status: outcome.status,
     ...(result.transactionHash
       ? { transactionHash: result.transactionHash }
       : {}),
-    ...(result.success && result.transactionLink
+    ...(result.transactionLink
       ? { transactionLink: result.transactionLink }
       : {}),
     ...(outcome.error ? { error: outcome.error } : {}),

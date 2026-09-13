@@ -127,6 +127,15 @@ export type TimeSeriesBucket = {
   running: number;
 };
 
+/**
+ * Buckets plus the width each one covers, so the chart can label them at the
+ * granularity they were actually aggregated at.
+ */
+export type TimeSeriesResponse = {
+  buckets: TimeSeriesBucket[];
+  intervalMs: number;
+};
+
 export type NetworkBreakdown = {
   network: string;
   totalGasWei: string;
@@ -174,6 +183,27 @@ export type RunQueryFilters = {
  */
 export type StatusFacets = Partial<Record<NormalizedStatus, number>>;
 
+/**
+ * Counts for every filter dimension that offers them, each computed with its
+ * own dimension lifted. Networks are keyed by the chain id a run's steps
+ * recorded, and include chains a run merely touched: a filter offering only the
+ * chains that spent gas hides every chain the org reads on.
+ */
+export type RunFacets = {
+  statusCounts: StatusFacets;
+  networkCounts: Record<string, number>;
+  gasCounts: Partial<Record<GasSpend, number>>;
+};
+
+/**
+ * Which counts a facets request wants. They are not equally cheap: status
+ * counts group `workflow_executions` alone, while network and gas both reach
+ * into the step logs - network to decode a chain out of JSONB, gas to run one
+ * count per bucket. Only status is cheap enough to ride the dashboard's poll;
+ * the other two are asked for when their dropdown is opened.
+ */
+export type FacetDimension = "status" | "network" | "gas";
+
 export type RunsFilters = RunQueryFilters & {
   range: TimeRange;
   cursor?: string;
@@ -188,6 +218,14 @@ export type RunsResponse = {
   total: number;
   page: number;
   pageSize: number;
+  /**
+   * KEEP-1042: ISO instant before which this organization's step logs have been
+   * removed, per the retention its plan sells. A run older than this is listed
+   * with its status and duration but has no steps behind it, so the Gas and
+   * Network cells and the expanded view have to say that rather than render the
+   * same blank a run that never recorded anything produces.
+   */
+  stepLogRetentionCutoff?: string | null;
 };
 
 export type StepLog = {

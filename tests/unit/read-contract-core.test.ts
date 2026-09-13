@@ -460,3 +460,158 @@ describe("read-contract-core - missing abiFunction (KEEP-371)", () => {
     }
   });
 });
+
+describe("read-contract-core - failOnError", () => {
+  const RPC_FAILURE = new Error(
+    "could not detect network (https://eth-mainnet.g.alchemy.com/v2/secret-key)"
+  );
+
+  it("hard-fails a read failure by default", async () => {
+    setupRpcMocks();
+    mockContractFunction.mockRejectedValueOnce(RPC_FAILURE);
+
+    const result = await readContractCore(makeInput());
+
+    expect(result.success).toBe(false);
+    if (result.success) {
+      return;
+    }
+    expect(result.errorClass).toBe("user");
+  });
+
+  it("softens a read failure into a success when failOnError is false", async () => {
+    setupRpcMocks();
+    mockContractFunction.mockRejectedValueOnce(RPC_FAILURE);
+
+    const result = await readContractCore(makeInput({ failOnError: false }));
+
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+    expect(result.result).toBeNull();
+    expect(result.error).toContain("Contract call failed");
+  });
+
+  it("accepts the string 'false' the visual editor persists", async () => {
+    setupRpcMocks();
+    mockContractFunction.mockRejectedValueOnce(RPC_FAILURE);
+
+    const result = await readContractCore(
+      makeInput({ failOnError: "false" as unknown as boolean })
+    );
+
+    expect(result.success).toBe(true);
+  });
+
+  it("redacts provider URLs in the softened error", async () => {
+    setupRpcMocks();
+    mockContractFunction.mockRejectedValueOnce(RPC_FAILURE);
+
+    const result = await readContractCore(makeInput({ failOnError: false }));
+
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+    expect(result.error).not.toContain("alchemy.com");
+    expect(result.error).not.toContain("secret-key");
+  });
+
+  it("softens a revert the same way", async () => {
+    setupRpcMocks();
+    mockContractFunction.mockRejectedValueOnce(
+      new Error("execution reverted: Vat/not-authorized")
+    );
+
+    const result = await readContractCore(makeInput({ failOnError: false }));
+
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+    expect(result.error).toContain("Vat/not-authorized");
+  });
+
+  it("softens a function missing from the ABI, like HTTP Request softens a 400", async () => {
+    setupRpcMocks();
+
+    const result = await readContractCore(
+      makeInput({ abiFunction: "notInAbi", failOnError: false })
+    );
+
+    // The ABI, the function name and the args are the payload, not the
+    // destination. HTTP Request hard-fails only an unusable URL; a request the
+    // far side rejects softens. This is the read-side equivalent, and it is
+    // what makes a For Each survive one item the contract will not accept.
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+    expect(result.result).toBeNull();
+    expect(result.error).toContain("not found in ABI");
+  });
+
+  it("still hard-fails an invalid contract address when failOnError is false", async () => {
+    setupRpcMocks();
+
+    const result = await readContractCore(
+      makeInput({ contractAddress: "not-an-address", failOnError: false })
+    );
+
+    // The address is the destination: with nowhere to call, a null-data
+    // success would let a permanently broken node run unnoticed.
+    expect(result.success).toBe(false);
+  });
+
+  it("still hard-fails an unresolvable network when failOnError is false", async () => {
+    mockGetChainIdFromNetwork.mockImplementation(() => {
+      throw new Error("Unsupported network");
+    });
+
+    const result = await readContractCore(
+      makeInput({ network: "not-a-chain", failOnError: false })
+    );
+
+    expect(result.success).toBe(false);
+  });
+
+  it("still hard-fails an unresolved RPC config when failOnError is false", async () => {
+    mockGetChainIdFromNetwork.mockReturnValue(1);
+    mockGetRpcProvider.mockRejectedValueOnce(new Error("No RPC configured"));
+
+    const result = await readContractCore(makeInput({ failOnError: false }));
+
+    expect(result.success).toBe(false);
+    if (result.success) {
+      return;
+    }
+    expect(result.errorClass).toBe("system");
+  });
+});
+
+describe("ABI fragment validation before RPC failover", () => {
+  it("N3 classifies a components-less legacy tuple as USER before provider creation", async () => {
+    vi.clearAllMocks();
+    const result = await readContractCore({
+      contractAddress: VALID_ADDRESS,
+      network: "ethereum",
+      abi: JSON.stringify([
+        {
+          type: "function",
+          name: "broken",
+          inputs: [{ name: "p", type: "tuple" }],
+        },
+        { type: "function", name: "broken", inputs: [] },
+      ]),
+      abiFunction: "broken(tuple)",
+      _context: { organizationId: "org-test" },
+    });
+    expect(result).toMatchObject({ success: false, errorClass: "user" });
+    if (!result.success) {
+      expect(result.error).toContain("Invalid ABI function");
+    }
+    expect(mockGetRpcProvider).not.toHaveBeenCalled();
+    expect(mockContractFunction).not.toHaveBeenCalled();
+  });
+});

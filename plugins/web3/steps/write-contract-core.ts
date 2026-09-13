@@ -25,7 +25,10 @@ import {
 import { getChainIdFromNetwork } from "@/lib/rpc/network-utils";
 import { getRpcProvider } from "@/lib/rpc/provider-factory";
 import { rpcRelayErrorClass } from "@/lib/rpc/providers";
-import { findAbiFunction } from "@/lib/abi/utils";
+import {
+  describeAmbiguousKey,
+  resolveAbiFunction,
+} from "@/lib/abi/utils";
 import { getErrorMessage, resolveFailOnError } from "@/lib/utils";
 import { getAbiFunctionKey } from "@/lib/abi/function-key";
 import { generateId } from "@/lib/utils/id";
@@ -142,6 +145,7 @@ export type WriteContractResult =
       // on pre-broadcast failures, where no transaction exists.
       transactionHash?: string;
       chainId?: number;
+      transactionLink?: string;
       // True when the terminal failure came from the gas-sponsored path, so
       // the finalizer can report the route accurately on a failed execution.
       sponsored?: boolean;
@@ -274,9 +278,17 @@ export async function writeContractCore(
     };
   }
 
-  const functionAbi = findAbiFunction(parsedAbi, abiFunction);
+  const resolution = resolveAbiFunction(parsedAbi, abiFunction);
 
-  if (!functionAbi) {
+  if (resolution.status === "ambiguous") {
+    return {
+      success: false,
+      error: describeAmbiguousKey(abiFunction, resolution.candidates),
+      errorClass: ExecutionErrorType.USER,
+    };
+  }
+
+  if (resolution.status !== "found") {
     return {
       success: false,
       error: `Function '${abiFunction}' not found in ABI`,
@@ -284,6 +296,7 @@ export async function writeContractCore(
     };
   }
 
+  const functionAbi = resolution.entry;
   const abiFunctionKey = getAbiFunctionKey(parsedAbi, abiFunction, functionAbi);
 
   // Parse function arguments
@@ -556,13 +569,35 @@ export async function writeContractCore(
         chainId,
       });
       if (!decision.fallback) {
+        let sponsoredFailureLink: string | undefined;
+        if (decision.transactionHash) {
+          try {
+            const explorerConfig = await db.query.explorerConfigs.findFirst({
+              where: eq(explorerConfigs.chainId, chainId),
+            });
+            if (explorerConfig) {
+              sponsoredFailureLink = getTransactionUrl(
+                explorerConfig,
+                decision.transactionHash
+              );
+            }
+          } catch {
+            // Non-critical -- the hash alone is enough to look up the tx.
+          }
+        }
         return {
           success: false,
           error: decision.error,
           errorClass: decision.errorClass,
           sponsored: true,
           ...(decision.transactionHash
-            ? { transactionHash: decision.transactionHash, chainId }
+            ? {
+                transactionHash: decision.transactionHash,
+                chainId,
+                ...(sponsoredFailureLink
+                  ? { transactionLink: sponsoredFailureLink }
+                  : {}),
+              }
             : {}),
         };
       }
@@ -706,6 +741,15 @@ export async function writeContractCore(
       );
       const rejection = classifyRevert(error, contractInterface);
       const broadcastHash = broadcastTransactionHash(error);
+      let broadcastTransactionLink: string | undefined;
+      if (broadcastHash) {
+        try {
+          broadcastTransactionLink =
+            await adapter.getTransactionUrl(broadcastHash);
+        } catch {
+          // Non-critical -- the hash alone is enough to look up the tx.
+        }
+      }
       // Set so a failOnError=false node cannot soften an unresolved in-flight
       // send into success. A relay-determined class is the more specific
       // answer, so it wins.
@@ -718,7 +762,13 @@ export async function writeContractCore(
         ...(errorClass ? { errorClass } : {}),
         ...(rejection.kind !== "unknown" ? { rejection } : {}),
         ...(broadcastHash
-          ? { transactionHash: broadcastHash, chainId }
+          ? {
+              transactionHash: broadcastHash,
+              chainId,
+              ...(broadcastTransactionLink
+                ? { transactionLink: broadcastTransactionLink }
+                : {}),
+            }
           : {}),
       };
     }
